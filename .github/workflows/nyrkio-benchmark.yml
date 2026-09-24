@@ -3,8 +3,12 @@
 # Trigger: GitHub UI -> Actions -> "Nyrkiö Benchmark" -> Run workflow.
 # Required repo secret: NYRKIO_JWT_TOKEN (nyrkio.com -> user menu -> User Settings).
 #
-# Runs on ubuntu-latest by default; for lower-noise results point runs-on at a
-# calibrated self-hosted runner label.
+# Two jobs on purpose: "benchmark" builds and runs code from the requested ref
+# (possibly a PR from another repo) and gets no secrets; "upload" only POSTs
+# the resulting JSON payloads and is the only job that sees NYRKIO_JWT_TOKEN.
+#
+# Runs on ubuntu-latest by default; for lower-noise results point the
+# benchmark job's runs-on at a calibrated self-hosted runner label.
 name: Nyrkiö Benchmark
 
 on:
@@ -15,13 +19,13 @@ on:
         type: string
         required: true
       retrospective:
-        description: "Full per-commit historical benchmark (for initial seeding)"
+        description: "Benchmark the ref's first-parent history (for initial seeding)"
         type: boolean
         default: false
       retrospective_limit:
-        description: "Max commits in retrospective mode (0 = all)"
+        description: "Retrospective: only the newest N commits (0 = all)"
         type: number
-        default: 0
+        default: 20
       full_benchmark:
         description: "Run sql-bench with full limits (default: small test)"
         type: boolean
@@ -33,26 +37,30 @@ permissions:
 jobs:
   benchmark:
     runs-on: ubuntu-latest
+    timeout-minutes: 360
     steps:
       - name: Checkout (full history for PR refs + retrospective)
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Install benchmark dependencies
+        # ubuntu 24.04 has no libdbd-mariadb-perl package: build DBD::MariaDB from CPAN
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev zlib1g-dev libdbi-perl libdbd-mariadb-perl
+          sudo apt-get install -y cmake bison libncurses-dev libssl-dev zlib1g-dev \
+            libdbi-perl libmariadb-dev cpanminus jq
+          sudo cpanm --notest DBD::MariaDB
 
-      - name: Benchmark and upload to Nyrkiö
+      - name: Benchmark (payloads only, no upload)
         env:
-          NYRKIO_JWT_TOKEN: ${{ secrets.NYRKIO_JWT_TOKEN }}
           REF: ${{ inputs.ref }}
           RETROSPECTIVE: ${{ inputs.retrospective }}
           RETROSPECTIVE_LIMIT: ${{ inputs.retrospective_limit }}
           FULL_BENCHMARK: ${{ inputs.full_benchmark }}
         run: |
-          args=(--ref "$REF")
+          args=(--ref "$REF" --dry-run --out-dir "$RUNNER_TEMP/nyrkio_payloads")
           if [ "$RETROSPECTIVE" = "true" ]; then
             args+=(--retrospective --limit "$RETROSPECTIVE_LIMIT")
           fi
@@ -60,3 +68,30 @@ jobs:
             args+=(--full)
           fi
           bash scripts/nyrkio_benchmark.sh "${args[@]}"
+
+      - name: Keep payloads
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyrkio-payloads
+          path: ${{ runner.temp }}/nyrkio_payloads/*.json
+          if-no-files-found: error
+
+  upload:
+    needs: benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (upload script only)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: nyrkio-payloads
+          path: ${{ runner.temp }}/nyrkio_payloads
+
+      - name: Upload to Nyrkiö
+        env:
+          NYRKIO_JWT_TOKEN: ${{ secrets.NYRKIO_JWT_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: bash scripts/nyrkio_benchmark.sh --ref "$REF" --upload "$RUNNER_TEMP/nyrkio_payloads"
