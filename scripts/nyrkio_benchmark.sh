@@ -266,15 +266,16 @@ run_sql_bench() {
   fi
 
   # pinned copy of this checkout's sql-bench; the source tree ships .sh names,
-  # the perl code requires the extensionless bench-init.pl / server-cfg
+  # but (like `make install`) the perl code wants them without the extension:
+  # bench-init.pl, server-cfg, and run-all-tests skips test-*.sh entirely
   rm -rf "$BENCH"
   cp -r "$ROOT/sql-bench" "$BENCH"
-  cp -f "$BENCH/bench-init.pl.sh" "$BENCH/bench-init.pl"
-  cp -f "$BENCH/server-cfg.sh" "$BENCH/server-cfg"
+  local f
+  for f in "$BENCH"/*.sh; do mv -f "$f" "${f%.sh}"; done
   mkdir -p "$BENCH/output"
   (
     cd "$BENCH"
-    perl run-all-tests.sh --server=mariadb --user="$BENCH_USER" --socket="$socket" \
+    perl run-all-tests --server=mariadb --user="$BENCH_USER" --socket="$socket" \
       --machine=nyrkio --log $small >&2
   ) || die "sql-bench run failed (see $RUN_FILE)"
   [[ -s $RUN_FILE ]] || die "sql-bench produced no output (expected $RUN_FILE)"
