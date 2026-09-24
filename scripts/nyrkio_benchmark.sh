@@ -49,6 +49,16 @@ OUT_DIR="$PWD/nyrkio_payloads"
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 log() { printf '%s\n' "$*" >&2; }
 
+# progress: every long phase announces what runs next and roughly how long it
+# takes, and reports its duration; bulky tool output is folded into GitHub
+# Actions log groups so these lines stay visible
+STEP_TAG="" STEP_START=0
+fmt_secs() { printf '%dm%02ds' $(( $1 / 60 )) $(( $1 % 60 )); }
+step() { STEP_START=$SECONDS; log "==> ${STEP_TAG}$*"; }
+step_done() { log "==> ${STEP_TAG}$* (took $(fmt_secs $(( SECONDS - STEP_START ))))"; }
+group() { [[ -z ${GITHUB_ACTIONS:-} ]] || log "::group::$*"; }
+endgroup() { [[ -z ${GITHUB_ACTIONS:-} ]] || log "::endgroup::"; }
+
 usage() {
   cat >&2 <<'USAGE'
 usage: nyrkio_benchmark.sh --ref REF [--retrospective] [--limit N] [--test-name NAME]
@@ -181,6 +191,7 @@ first_existing() { # print the first executable among the args
 }
 
 prepare_source() { # $1=sha
+  step "checking out into $SRC and updating submodules"
   mkdir -p "$WORK"
   if [[ ! -e $SRC/.git ]]; then
     git worktree prune
@@ -193,13 +204,21 @@ prepare_source() { # $1=sha
   git -C "$SRC" submodule update --recursive --depth 1 >&2 \
     || die "cannot update submodules for $1"
   [[ -f $SRC/CMakeLists.txt ]] || die "$1 predates the CMake build (no CMakeLists.txt)"
+  step_done "source ready"
 }
 
 build_server() {
   command -v cmake >/dev/null 2>&1 || die "cmake is required to build MariaDB"
-  log "building $(git -C "$SRC" rev-parse --short HEAD) (cmake, this can take a while)..."
+  if [[ -f $BUILD/CMakeCache.txt ]]; then
+    step "building MariaDB: incremental rebuild of the previous build (usually a few minutes)"
+  else
+    step "building MariaDB: cold build with $(nproc) jobs, expect ~30-45 min on a 4-core hosted runner"
+  fi
+  group "cmake configure + build output"
   cmake -S "$SRC" -B "$BUILD" "${CMAKE_FLAGS[@]}" >&2
   cmake --build "$BUILD" -j"$(nproc)" >&2
+  endgroup
+  step_done "build finished"
   # 10.5+ names first, pre-10.5 names as fallback
   MYSQLD=$(first_existing "$BUILD/sql/mariadbd" "$BUILD/sql/mysqld") \
     || die "build finished but no server binary in $BUILD/sql"
@@ -213,16 +232,21 @@ start_server() {
     || die "no mariadb-install-db in $BUILD/scripts"
   (( EUID == 0 )) && user_opt=(--user=root)   # mariadbd refuses to run as root otherwise
   DATADIR=$(mktemp -d "${TMPDIR:-/tmp}/nyrkio-data.XXXXXX")
+  step "creating a fresh datadir (mariadb-install-db) and starting the server"
+  # its chatty "... OK" + securing-the-server advice only matters on failure
   "$install_db" --no-defaults --srcdir="$SRC" --builddir="$BUILD" --datadir="$DATADIR" \
-    --auth-root-authentication-method=normal "${user_opt[@]}" >&2 \
-    || die "mariadb-install-db failed (datadir: $DATADIR)"
+    --auth-root-authentication-method=normal "${user_opt[@]}" >"$DATADIR/install-db.log" 2>&1 \
+    || { cat "$DATADIR/install-db.log" >&2; die "mariadb-install-db failed (datadir: $DATADIR)"; }
   "$MYSQLD" --no-defaults --datadir="$DATADIR" --socket="$DATADIR/mysql.sock" \
             --skip-networking --pid-file="$DATADIR/mysqld.pid" \
             --log-error="$DATADIR/error.log" "${user_opt[@]}" >&2 &
   MYSQLD_PID=$!
   local i
   for i in $(seq 1 60); do
-    "$MYSQLADMIN" --no-defaults --user=root --socket="$DATADIR/mysql.sock" ping >/dev/null 2>&1 && return
+    if "$MYSQLADMIN" --no-defaults --user=root --socket="$DATADIR/mysql.sock" ping >/dev/null 2>&1; then
+      step_done "server $("$MYSQLD" --version | awk '{ print $3 }') is up"
+      return
+    fi
     kill -0 "$MYSQLD_PID" 2>/dev/null || { cat "$DATADIR/error.log" >&2 || true; die "server died during startup"; }
     sleep 1
   done
@@ -275,11 +299,22 @@ run_sql_bench() {
   local f
   for f in "$BENCH"/*.sh; do mv -f "$f" "${f%.sh}"; done
   mkdir -p "$BENCH/output"
+  local ntests
+  ntests=$(find "$BENCH" -maxdepth 1 -name 'test-*' ! -name '*-fork' | wc -l)
+  if (( FULL )); then
+    step "running sql-bench, full limits: $ntests test suites, can take several hours"
+  else
+    step "running sql-bench --small-test: $ntests test suites, usually a few minutes"
+  fi
+  log "    each suite prints '<name>: Total time: ...' when it finishes; a pause after '<name>:' is that suite running"
+  # no --log: the report goes to the job log as it is produced, and tee keeps
+  # the RUN file that parse_run_file reads
   (
     cd "$BENCH"
     perl run-all-tests --server=mariadb --user="$BENCH_USER" --socket="$socket" \
-      --machine=nyrkio --log $small >&2
+      --machine=nyrkio $small | tee "$RUN_FILE" >&2
   ) || die "sql-bench run failed (see $RUN_FILE)"
+  step_done "sql-bench finished"
   [[ -s $RUN_FILE ]] || die "sql-bench produced no output (expected $RUN_FILE)"
 
   [[ -n ${NYRKIO_MYSQL_SOCKET:-} ]] || stop_server   # only stop a server we started ourselves
@@ -304,6 +339,8 @@ write_payload() { # $1=file $2=sha $3=timestamp $4=branch
 process_commit() { # $1=sha $2=sequence number
   local sha=$1 ts payload
   ts=$(git show -s --format=%ct "$sha")   # commit time, Unix epoch
+  STEP_TAG="[$2/$TOTAL ${sha:0:10}] "
+  log "==> ${STEP_TAG}$(git show -s --format='%cs %s' "$sha")"
   if (( DUMMY )); then
     run_benchmark_dummy
   else
@@ -329,6 +366,7 @@ if (( RETRO )); then
   limit_opt=()
   (( LIMIT > 0 )) && limit_opt=(-n "$LIMIT")
   mapfile -t commits < <(git rev-list --first-parent "${limit_opt[@]}" "$TARGET" | tac)
+  TOTAL=${#commits[@]}
   log "retrospective: ${#commits[@]} first-parent commits, oldest first"
   # one commit that does not build/bench (too old, or broken) must not end the
   # history run: each commit runs in its own subshell, with its own cleanup
@@ -348,5 +386,6 @@ if (( RETRO )); then
   if (( ${#skipped[@]} )); then log "skipped: ${skipped[*]}"; fi
   (( ${#skipped[@]} < ${#commits[@]} )) || die "no commit could be benchmarked"
 else
+  TOTAL=1
   process_commit "$TARGET" 1
 fi
