@@ -23,7 +23,7 @@ on:
         type: boolean
         default: false
       retrospective_limit:
-        description: "Retrospective: only the newest N commits (0 = all)"
+        description: "Retrospective: only the newest N commits (1-50; each commit is a full build + bench run)"
         type: number
         default: 20
       full_benchmark:
@@ -62,6 +62,11 @@ jobs:
         run: |
           args=(--ref "$REF" --dry-run --out-dir "$RUNNER_TEMP/nyrkio_payloads")
           if [ "$RETROSPECTIVE" = "true" ]; then
+            # a hosted job has 6h: the whole history (~10k commits) can never finish
+            if [ "$RETROSPECTIVE_LIMIT" -lt 1 ] || [ "$RETROSPECTIVE_LIMIT" -gt 50 ]; then
+              echo "::error::retrospective_limit must be between 1 and 50 (got $RETROSPECTIVE_LIMIT)"
+              exit 1
+            fi
             args+=(--retrospective --limit "$RETROSPECTIVE_LIMIT")
           fi
           if [ "$FULL_BENCHMARK" = "true" ]; then

@@ -10,7 +10,8 @@
 #                       PR URL (https://github.com/<owner>/<repo>/pull/<N>)
 #   --retrospective     benchmark the ref's first-parent history, oldest first
 #                       (each commit: incremental rebuild + bench run — slow on purpose)
-#   --limit N           retrospective: only the newest N commits (0 = no cap)
+#   --limit N           retrospective: only the newest N commits (0 = no cap;
+#                       commits that fail to build or bench are skipped)
 #   --test-name NAME    Nyrkiö test name (default: mariadb_server/benchmark)
 #   --full              run sql-bench with full limits (default: --small-test)
 #   --dummy             upload simulated metrics instead of real sql-bench data
@@ -191,6 +192,7 @@ prepare_source() { # $1=sha
   git -C "$SRC" submodule sync --quiet --recursive >&2
   git -C "$SRC" submodule update --recursive --depth 1 >&2 \
     || die "cannot update submodules for $1"
+  [[ -f $SRC/CMakeLists.txt ]] || die "$1 predates the CMake build (no CMakeLists.txt)"
 }
 
 build_server() {
@@ -328,10 +330,23 @@ if (( RETRO )); then
   (( LIMIT > 0 )) && limit_opt=(-n "$LIMIT")
   mapfile -t commits < <(git rev-list --first-parent "${limit_opt[@]}" "$TARGET" | tac)
   log "retrospective: ${#commits[@]} first-parent commits, oldest first"
+  # one commit that does not build/bench (too old, or broken) must not end the
+  # history run: each commit runs in its own subshell, with its own cleanup
+  # (set +e around it: set -e inside a subshell tested by `if` would be ignored)
+  skipped=()
   for i in "${!commits[@]}"; do
-    process_commit "${commits[$i]}" "$((i + 1))"
+    set +e
+    ( set -e; trap cleanup EXIT; process_commit "${commits[$i]}" "$((i + 1))" )
+    rc=$?
+    set -e
+    if (( rc != 0 )); then
+      skipped+=("${commits[$i]}")
+      log "skipped ${commits[$i]} (exit $rc), continuing"
+    fi
   done
-  log "done: ${#commits[@]} commits benchmarked"
+  log "done: $(( ${#commits[@]} - ${#skipped[@]} )) of ${#commits[@]} commits benchmarked"
+  if (( ${#skipped[@]} )); then log "skipped: ${skipped[*]}"; fi
+  (( ${#skipped[@]} < ${#commits[@]} )) || die "no commit could be benchmarked"
 else
   process_commit "$TARGET" 1
 fi
