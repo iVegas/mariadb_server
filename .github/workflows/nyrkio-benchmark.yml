@@ -1,0 +1,62 @@
+# Manual Nyrkiö performance benchmark (replaces the deprecated nyrkio/change-detection action).
+#
+# Trigger: GitHub UI -> Actions -> "Nyrkiö Benchmark" -> Run workflow.
+# Required repo secret: NYRKIO_JWT_TOKEN (nyrkio.com -> user menu -> User Settings).
+#
+# Runs on ubuntu-latest by default; for lower-noise results point runs-on at a
+# calibrated self-hosted runner label.
+name: Nyrkiö Benchmark
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, commit SHA, PR number (123 / #123), or full PR URL (https://github.com/<owner>/<repo>/pull/<N>)"
+        type: string
+        required: true
+      retrospective:
+        description: "Full per-commit historical benchmark (for initial seeding)"
+        type: boolean
+        default: false
+      retrospective_limit:
+        description: "Max commits in retrospective mode (0 = all)"
+        type: number
+        default: 0
+      full_benchmark:
+        description: "Run sql-bench with full limits (default: small test)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for PR refs + retrospective)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install benchmark dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev zlib1g-dev libdbi-perl libdbd-mariadb-perl
+
+      - name: Benchmark and upload to Nyrkiö
+        env:
+          NYRKIO_JWT_TOKEN: ${{ secrets.NYRKIO_JWT_TOKEN }}
+          REF: ${{ inputs.ref }}
+          RETROSPECTIVE: ${{ inputs.retrospective }}
+          RETROSPECTIVE_LIMIT: ${{ inputs.retrospective_limit }}
+          FULL_BENCHMARK: ${{ inputs.full_benchmark }}
+        run: |
+          args=(--ref "$REF")
+          if [ "$RETROSPECTIVE" = "true" ]; then
+            args+=(--retrospective --limit "$RETROSPECTIVE_LIMIT")
+          fi
+          if [ "$FULL_BENCHMARK" = "true" ]; then
+            args+=(--full)
+          fi
+          bash scripts/nyrkio_benchmark.sh "${args[@]}"
