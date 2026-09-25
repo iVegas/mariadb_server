@@ -1,90 +1,148 @@
-# Manual Nyrkiö performance benchmark (replaces the deprecated nyrkio/change-detection action).
+# Nyrkiö performance benchmark of the MariaDB server: builds a commit, runs sql-bench
+# and POSTs the results to the Nyrkiö HTTP API (replaces the deprecated
+# nyrkio/change-detection action). Same setup as tursodatabase/turso's perf_nightly.yml.
 #
-# Trigger: GitHub UI -> Actions -> "Nyrkiö Benchmark" -> Run workflow.
+# Triggers:
+#   - nightly (schedule): the tip of the default branch, skipped when it is the commit
+#     the last successful nightly already did
+#   - manual: GitHub UI -> Actions -> "Nyrkiö Benchmark" -> Run workflow
 # Required repo secret: NYRKIO_JWT_TOKEN (nyrkio.com -> user menu -> User Settings).
 #
-# Orchestrator: runs one iteration (nyrkio-benchmark-iteration.yml) and, for a
-# retrospective run that is not finished, dispatches itself again with the
-# pinned target and the cursor the iteration reported. The history is thus
-# benchmarked oldest -> newest as a chain of runs, each inside the 6h job limit.
-# Only history the pinned sql-bench supports (10.5.0+) is benchmarked.
+# Optional repo variables:
+#   NYRKIO_RUNNER, NYRKIO_TIMEOUT_MIN  low-noise runner label (e.g.
+#                                      nyrkio_perf_server_4cpu_ubuntu2404) and its job limit
+#                                      (92 there); default ubuntu-latest / 360
+#   NYRKIO_PUBLIC                      true|false: make the results public
+#   NYRKIO_MAX_PVALUE, NYRKIO_MIN_MAGNITUDE  change detection settings (global to the Nyrkiö user)
 #
-# Stop a chain: cancel the running orchestrator run before its "next" job fires.
+# Two jobs on purpose: "benchmark" builds and runs code from the requested ref
+# (possibly a PR from another repo) and gets no secrets; "upload" only POSTs
+# the resulting JSON payloads and is the only job that sees NYRKIO_JWT_TOKEN.
 name: Nyrkiö Benchmark
 
 on:
+  schedule:
+    - cron: '24 4 * * *'
   workflow_dispatch:
     inputs:
       ref:
-        description: "Branch, tag, commit SHA, PR number (123 / #123), or full PR URL (https://github.com/<owner>/<repo>/pull/<N>)"
+        description: "Branch, tag, commit SHA, PR number (123 / #123), or full PR URL (https://github.com/<owner>/<repo>/pull/<N>). Empty: the branch this workflow runs from"
         type: string
-        required: true
-      retrospective:
-        description: "Benchmark the ref's whole supported history, oldest first, as a chain of runs"
-        type: boolean
-        default: false
-      stride:
-        description: "Retrospective: benchmark every Nth first-parent commit (1 = all ~3.5k; each is a rebuild + bench run)"
-        type: number
-        default: 50
-      limit:
-        description: "Retrospective: max commits per iteration (0 = only the time budget limits it)"
-        type: number
-        default: 0
-      budget:
-        description: "Minutes per iteration after which no new commit is started (hosted job limit is 360)"
-        type: number
-        default: 240
+        default: ""
       full_benchmark:
         description: "Run sql-bench with full limits (default: small test)"
         type: boolean
         default: false
-      target:
-        description: "Chain state, set by the orchestrator: commit the ref resolved to"
-        type: string
-        default: ""
-      since:
-        description: "Chain state, set by the orchestrator: last commit already benchmarked"
-        type: string
-        default: ""
 
 permissions:
   contents: read
 
 jobs:
-  iterate:
-    uses: ./.github/workflows/nyrkio-benchmark-iteration.yml
-    secrets: inherit
-    with:
-      ref: ${{ inputs.ref }}
-      target: ${{ inputs.target }}
-      since: ${{ inputs.since }}
-      retrospective: ${{ inputs.retrospective }}
-      stride: ${{ inputs.stride }}
-      limit: ${{ inputs.limit }}
-      budget: ${{ inputs.budget }}
-      full_benchmark: ${{ inputs.full_benchmark }}
-
-  next:
-    needs: iterate
-    if: inputs.retrospective && needs.iterate.outputs.done == 'false'
+  gate:
     runs-on: ubuntu-latest
     permissions:
-      actions: write   # dispatch the next orchestrator run (GITHUB_TOKEN dispatches are allowed to trigger runs)
-    env:
-      GH_TOKEN: ${{ github.token }}
-      GH_REPO: ${{ github.repository }}
-      REF: ${{ inputs.ref }}
-      STRIDE: ${{ inputs.stride }}
-      LIMIT: ${{ inputs.limit }}
-      BUDGET: ${{ inputs.budget }}
-      FULL_BENCHMARK: ${{ inputs.full_benchmark }}
-      TARGET: ${{ needs.iterate.outputs.target }}
-      SINCE: ${{ needs.iterate.outputs.next_since }}
+      actions: read
+    outputs:
+      run: ${{ steps.gate.outputs.run }}
     steps:
-      - name: Dispatch the next iteration
+      - id: gate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh workflow run nyrkio-benchmark.yml --ref "$GITHUB_REF_NAME" \
-            -f ref="$REF" -f retrospective=true -f stride="$STRIDE" -f limit="$LIMIT" \
-            -f budget="$BUDGET" -f full_benchmark="$FULL_BENCHMARK" \
-            -f target="$TARGET" -f since="$SINCE"
+          # ponytail: only nightlies are gated; a manual run always runs
+          last=""
+          if [ "$GITHUB_EVENT_NAME" = schedule ]; then
+            last=$(gh run list --workflow nyrkio-benchmark.yml --event schedule --status success \
+                     --limit 1 --json headSha --jq '.[0].headSha // ""')
+          fi
+          if [ "$last" = "$GITHUB_SHA" ]; then
+            echo "run=false" >> "$GITHUB_OUTPUT"
+            echo "tip $GITHUB_SHA was already benchmarked by the last nightly"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  benchmark:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
+    runs-on: ${{ vars.NYRKIO_RUNNER || 'ubuntu-latest' }}
+    timeout-minutes: ${{ fromJSON(vars.NYRKIO_TIMEOUT_MIN || '360') }}
+    steps:
+      - name: Checkout (full history for PR refs)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install benchmark dependencies
+        # ubuntu 24.04 has no libdbd-mariadb-perl package: build DBD::MariaDB from CPAN
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake bison libncurses-dev libssl-dev zlib1g-dev \
+            libdbi-perl libmariadb-dev cpanminus jq ccache
+          sudo cpanm --notest DBD::MariaDB
+
+      # a fresh runner every night: without this each one starts with a cold build
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: ccache-
+
+      - name: Benchmark (payloads only, no upload)
+        env:
+          REF: ${{ inputs.ref || github.ref_name }}
+          FULL_BENCHMARK: ${{ inputs.full_benchmark }}
+          CCACHE_MAXSIZE: 5G
+          NYRKIO_CMAKE_FLAGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        run: |
+          export CCACHE_DIR="$HOME/.ccache"
+          args=(--ref "$REF" --dry-run --out-dir "$RUNNER_TEMP/nyrkio_payloads")
+          if [ "$FULL_BENCHMARK" = "true" ]; then
+            args+=(--full)
+          fi
+          bash scripts/nyrkio_benchmark.sh "${args[@]}"
+
+      - name: Keep payloads
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyrkio-payloads
+          path: ${{ runner.temp }}/nyrkio_payloads/*.json
+          if-no-files-found: ignore
+
+  upload:
+    needs: benchmark
+    if: ${{ !cancelled() && needs.benchmark.result != 'skipped' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (upload script only)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true   # no artifact = nothing was benchmarked
+        with:
+          name: nyrkio-payloads
+          path: ${{ runner.temp }}/nyrkio_payloads
+
+      - name: Apply Nyrkiö settings
+        if: ${{ vars.NYRKIO_PUBLIC != '' || vars.NYRKIO_MAX_PVALUE != '' }}
+        env:
+          NYRKIO_JWT_TOKEN: ${{ secrets.NYRKIO_JWT_TOKEN }}
+          NYRKIO_PUBLIC: ${{ vars.NYRKIO_PUBLIC }}
+          NYRKIO_MAX_PVALUE: ${{ vars.NYRKIO_MAX_PVALUE }}
+          NYRKIO_MIN_MAGNITUDE: ${{ vars.NYRKIO_MIN_MAGNITUDE }}
+          REF: ${{ inputs.ref || github.ref_name }}
+        run: bash scripts/nyrkio_benchmark.sh --ref "$REF" --configure
+
+      - name: Upload to Nyrkiö
+        env:
+          NYRKIO_JWT_TOKEN: ${{ secrets.NYRKIO_JWT_TOKEN }}
+          REF: ${{ inputs.ref || github.ref_name }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/nyrkio_payloads"
+          bash scripts/nyrkio_benchmark.sh --ref "$REF" --upload "$RUNNER_TEMP/nyrkio_payloads"
