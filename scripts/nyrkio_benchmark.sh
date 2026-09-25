@@ -27,6 +27,8 @@
 #                       (upload-plumbing tests only — never use for real data)
 #   --dry-run           write payloads to --out-dir but do not POST
 #   --out-dir DIR       where payloads are written (default: ./nyrkio_payloads)
+#   --configure         do not benchmark: apply the Nyrkiö settings given by env (see
+#                       NYRKIO_PUBLIC / NYRKIO_MAX_PVALUE below) for --ref (a branch), then exit
 #   --upload DIR        do not benchmark: POST every DIR/*.json payload, in name
 #                       order, to the endpoint derived from --ref (no git fetch)
 #
@@ -41,6 +43,10 @@
 #
 # Env:
 #   NYRKIO_JWT_TOKEN     required unless --dry-run (nyrkio.com -> user menu -> User Settings)
+#   NYRKIO_PUBLIC        --configure: true|false, make the --ref branch's results public (or not)
+#   NYRKIO_MAX_PVALUE    --configure: change detection p-value (smaller = fewer, surer change
+#                        points); NYRKIO_MIN_MAGNITUDE (default 0) is the smallest change
+#                        reported. Both are global to the Nyrkiö user, not per test
 #   NYRKIO_API_ROOT      default https://nyrkio.com/api/v0
 #   GITHUB_OUTPUT       when set, target/next_since/done are appended to it
 #   NYRKIO_WORKDIR       worktree + build dir (default: $RUNNER_TEMP or $TMPDIR /nyrkio-work)
@@ -57,7 +63,7 @@ set -euo pipefail
 
 API_ROOT="${NYRKIO_API_ROOT:-https://nyrkio.com/api/v0}"
 TEST_NAME="mariadb_server/benchmark"
-REF="" RETRO=0 LIMIT=0 STRIDE=1 BUDGET=0 SINCE="" PIN="" DRY_RUN=0 DUMMY=0 FULL=0 UPLOAD_DIR=""
+REF="" CONFIGURE=0 RETRO=0 LIMIT=0 STRIDE=1 BUDGET=0 SINCE="" PIN="" DRY_RUN=0 DUMMY=0 FULL=0 UPLOAD_DIR=""
 OUT_DIR="$PWD/nyrkio_payloads"
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -78,6 +84,7 @@ usage() {
 usage: nyrkio_benchmark.sh --ref REF [--retrospective] [--stride N] [--since SHA] [--target SHA]
                            [--limit N] [--budget MIN] [--test-name NAME] [--full] [--dummy] [--dry-run] [--out-dir DIR]
        nyrkio_benchmark.sh --ref REF [--test-name NAME] --upload DIR
+       nyrkio_benchmark.sh --ref BRANCH [--test-name NAME] --configure
   REF: branch, tag, commit SHA, PR number (123 / #123), or full PR URL
 USAGE
 }
@@ -96,6 +103,7 @@ while [[ $# -gt 0 ]]; do
     --dummy)         DUMMY=1; shift ;;
     --dry-run)       DRY_RUN=1; shift ;;
     --out-dir)       [[ $# -ge 2 ]] || die "--out-dir needs a value"; OUT_DIR=$2; shift 2 ;;
+    --configure)     CONFIGURE=1; shift ;;
     --upload)        [[ $# -ge 2 ]] || die "--upload needs a value"; UPLOAD_DIR=$2; shift 2 ;;
     -h|--help)       usage; exit 0 ;;
     *)               usage; die "unknown argument: $1" ;;
@@ -106,6 +114,7 @@ done
 [[ $BUDGET =~ ^[0-9]+$ ]] || die "--budget must be a non-negative integer"
 [[ $STRIDE =~ ^[1-9][0-9]*$ ]] || die "--stride must be a positive integer"
 [[ -n $UPLOAD_DIR && $DRY_RUN == 1 ]] && die "--upload and --dry-run are mutually exclusive"
+(( CONFIGURE && DRY_RUN )) && die "--configure and --dry-run are mutually exclusive"
 
 for tool in git curl jq; do
   command -v "$tool" >/dev/null 2>&1 || die "$tool is required"
@@ -162,6 +171,36 @@ if [[ -n $UPLOAD_DIR ]]; then
   (( ${#payloads[@]} )) || { log "no payloads in $UPLOAD_DIR, nothing to upload"; exit 0; }
   for p in "${payloads[@]}"; do post_payload "$p"; done
   log "done: ${#payloads[@]} payload(s) uploaded"
+  exit 0
+fi
+
+# --- configure ------------------------------------------------------------------
+api() { # $1=GET|POST $2=path [$3=json body]: prints the response body
+  local body=()
+  [[ -z ${3:-} ]] || body=(--data "$3")
+  curl --fail --silent --show-error --request "$1" \
+    --header "Authorization: Bearer ${NYRKIO_JWT_TOKEN}" --header "Content-Type: application/json" \
+    "${body[@]}" "${API_ROOT}/$2"
+}
+
+if (( CONFIGURE )); then
+  [[ $MODE == branch ]] || { log "--configure applies to branches only, skipping PR ref"; exit 0; }
+  if [[ -n ${NYRKIO_PUBLIC:-} ]]; then
+    api POST "config/${TEST_NAME}" "$(jq -n -c --argjson public "$NYRKIO_PUBLIC" \
+      --arg repo "https://github.com/${RESULT_REPO}" --arg branch "$REF" \
+      '[{public: $public, attributes: {git_repo: $repo, branch: $branch}}]')" >/dev/null \
+      || die "cannot set public=$NYRKIO_PUBLIC on $TEST_NAME (409: the name is taken by another user)"
+    log "configured: $TEST_NAME on $RESULT_REPO/$REF public=$NYRKIO_PUBLIC"
+  fi
+  if [[ -n ${NYRKIO_MAX_PVALUE:-} ]]; then
+    # POST replaces the whole user config: read it, change only .core, write it back
+    cfg=$(api GET user/config 2>/dev/null || true)
+    [[ -n $cfg && $cfg != null ]] || cfg='{}'
+    api POST user/config "$(jq -c --argjson p "$NYRKIO_MAX_PVALUE" --argjson m "${NYRKIO_MIN_MAGNITUDE:-0}" \
+      '. + {core: {max_pvalue: $p, min_magnitude: $m}}' <<< "$cfg")" >/dev/null \
+      || die "cannot update the user config"
+    log "configured: max_pvalue=$NYRKIO_MAX_PVALUE min_magnitude=${NYRKIO_MIN_MAGNITUDE:-0} (global to the user)"
+  fi
   exit 0
 fi
 
