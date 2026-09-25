@@ -1,0 +1,119 @@
+# One benchmark iteration (reusable; started by nyrkio-benchmark.yml, not by hand).
+#
+# Benchmarks one time-boxed slice of the requested history and uploads it. The
+# outputs tell the orchestrator where the next iteration continues, so a full
+# history is a chain of iterations that each fit the 6h hosted-job limit.
+#
+# Two jobs on purpose: "benchmark" builds and runs code from the requested ref
+# (possibly a PR from another repo) and gets no secrets; "upload" only POSTs
+# the resulting JSON payloads and is the only job that sees NYRKIO_JWT_TOKEN.
+#
+# Runs on ubuntu-latest by default; for lower-noise results point the
+# benchmark job's runs-on at a calibrated self-hosted runner label.
+name: Nyrkiö Benchmark iteration
+
+on:
+  workflow_call:
+    inputs:
+      ref:           { type: string,  required: true }
+      target:        { type: string,  default: "" }     # commit pinned by the first iteration
+      since:         { type: string,  default: "" }     # cursor: continue after this commit
+      retrospective: { type: boolean, default: false }
+      stride:        { type: number,  default: 1 }
+      limit:         { type: number,  default: 0 }
+      budget:        { type: number,  default: 240 }    # minutes; no new commit is started after it
+      full_benchmark: { type: boolean, default: false }
+    outputs:
+      target:     { value: "${{ jobs.benchmark.outputs.target }}" }
+      next_since: { value: "${{ jobs.benchmark.outputs.next_since }}" }
+      done:       { value: "${{ jobs.benchmark.outputs.done }}" }
+
+permissions:
+  contents: read
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360   # hosted maximum; budget leaves the rest for the last in-flight commit
+    outputs:
+      target: ${{ steps.bench.outputs.target }}
+      next_since: ${{ steps.bench.outputs.next_since }}
+      done: ${{ steps.bench.outputs.done }}
+    steps:
+      - name: Checkout (full history for PR refs + retrospective)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install benchmark dependencies
+        # ubuntu 24.04 has no libdbd-mariadb-perl package: build DBD::MariaDB from CPAN
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake bison libncurses-dev libssl-dev zlib1g-dev \
+            libdbi-perl libmariadb-dev cpanminus jq ccache
+          sudo cpanm --notest DBD::MariaDB
+
+      # each iteration is a fresh runner: without this every one starts with a cold build
+      - name: Restore ccache
+        uses: actions/cache@v4
+        with:
+          path: ~/.ccache
+          key: ccache-${{ github.run_id }}
+          restore-keys: ccache-
+
+      - name: Benchmark (payloads only, no upload)
+        id: bench
+        env:
+          REF: ${{ inputs.ref }}
+          TARGET: ${{ inputs.target }}
+          SINCE: ${{ inputs.since }}
+          RETROSPECTIVE: ${{ inputs.retrospective }}
+          STRIDE: ${{ inputs.stride }}
+          LIMIT: ${{ inputs.limit }}
+          BUDGET: ${{ inputs.budget }}
+          FULL_BENCHMARK: ${{ inputs.full_benchmark }}
+          CCACHE_MAXSIZE: 5G
+          NYRKIO_CMAKE_FLAGS: -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+        run: |
+          export CCACHE_DIR="$HOME/.ccache"
+          args=(--ref "$REF" --dry-run --out-dir "$RUNNER_TEMP/nyrkio_payloads")
+          [ -z "$TARGET" ] || args+=(--target "$TARGET")
+          if [ "$RETROSPECTIVE" = "true" ]; then
+            args+=(--retrospective --stride "$STRIDE" --limit "$LIMIT" --budget "$BUDGET")
+            [ -z "$SINCE" ] || args+=(--since "$SINCE")
+          fi
+          if [ "$FULL_BENCHMARK" = "true" ]; then
+            args+=(--full)
+          fi
+          bash scripts/nyrkio_benchmark.sh "${args[@]}"
+
+      - name: Keep payloads
+        uses: actions/upload-artifact@v4
+        with:
+          name: nyrkio-payloads
+          path: ${{ runner.temp }}/nyrkio_payloads/*.json
+          if-no-files-found: ignore   # a slice of only unbuildable commits is not an error
+
+  upload:
+    needs: benchmark
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (upload script only)
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        continue-on-error: true   # no artifact = nothing was benchmarked in this slice
+        with:
+          name: nyrkio-payloads
+          path: ${{ runner.temp }}/nyrkio_payloads
+
+      - name: Upload to Nyrkiö
+        env:
+          NYRKIO_JWT_TOKEN: ${{ secrets.NYRKIO_JWT_TOKEN }}
+          REF: ${{ inputs.ref }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/nyrkio_payloads"
+          bash scripts/nyrkio_benchmark.sh --ref "$REF" --upload "$RUNNER_TEMP/nyrkio_payloads"

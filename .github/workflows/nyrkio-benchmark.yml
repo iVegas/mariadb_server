@@ -3,12 +3,13 @@
 # Trigger: GitHub UI -> Actions -> "Nyrkiö Benchmark" -> Run workflow.
 # Required repo secret: NYRKIO_JWT_TOKEN (nyrkio.com -> user menu -> User Settings).
 #
-# Two jobs on purpose: "benchmark" builds and runs code from the requested ref
-# (possibly a PR from another repo) and gets no secrets; "upload" only POSTs
-# the resulting JSON payloads and is the only job that sees NYRKIO_JWT_TOKEN.
+# Orchestrator: runs one iteration (nyrkio-benchmark-iteration.yml) and, for a
+# retrospective run that is not finished, dispatches itself again with the
+# pinned target and the cursor the iteration reported. The history is thus
+# benchmarked oldest -> newest as a chain of runs, each inside the 6h job limit.
+# Only history the pinned sql-bench supports (10.5.0+) is benchmarked.
 #
-# Runs on ubuntu-latest by default; for lower-noise results point the
-# benchmark job's runs-on at a calibrated self-hosted runner label.
+# Stop a chain: cancel the running orchestrator run before its "next" job fires.
 name: Nyrkiö Benchmark
 
 on:
@@ -19,84 +20,71 @@ on:
         type: string
         required: true
       retrospective:
-        description: "Benchmark the ref's first-parent history (for initial seeding)"
+        description: "Benchmark the ref's whole supported history, oldest first, as a chain of runs"
         type: boolean
         default: false
-      retrospective_limit:
-        description: "Retrospective: only the newest N commits (1-50; each commit is a full build + bench run)"
+      stride:
+        description: "Retrospective: benchmark every Nth first-parent commit (1 = all ~3.5k; each is a rebuild + bench run)"
         type: number
-        default: 20
+        default: 50
+      limit:
+        description: "Retrospective: max commits per iteration (0 = only the time budget limits it)"
+        type: number
+        default: 0
+      budget:
+        description: "Minutes per iteration after which no new commit is started (hosted job limit is 360)"
+        type: number
+        default: 240
       full_benchmark:
         description: "Run sql-bench with full limits (default: small test)"
         type: boolean
         default: false
+      target:
+        description: "Chain state, set by the orchestrator: commit the ref resolved to"
+        type: string
+        default: ""
+      since:
+        description: "Chain state, set by the orchestrator: last commit already benchmarked"
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 jobs:
-  benchmark:
+  iterate:
+    uses: ./.github/workflows/nyrkio-benchmark-iteration.yml
+    secrets: inherit
+    with:
+      ref: ${{ inputs.ref }}
+      target: ${{ inputs.target }}
+      since: ${{ inputs.since }}
+      retrospective: ${{ inputs.retrospective }}
+      stride: ${{ inputs.stride }}
+      limit: ${{ inputs.limit }}
+      budget: ${{ inputs.budget }}
+      full_benchmark: ${{ inputs.full_benchmark }}
+
+  next:
+    needs: iterate
+    if: inputs.retrospective && needs.iterate.outputs.done == 'false'
     runs-on: ubuntu-latest
-    timeout-minutes: 360
+    permissions:
+      actions: write   # dispatch the next orchestrator run (GITHUB_TOKEN dispatches are allowed to trigger runs)
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      REF: ${{ inputs.ref }}
+      STRIDE: ${{ inputs.stride }}
+      LIMIT: ${{ inputs.limit }}
+      BUDGET: ${{ inputs.budget }}
+      FULL_BENCHMARK: ${{ inputs.full_benchmark }}
+      TARGET: ${{ needs.iterate.outputs.target }}
+      SINCE: ${{ needs.iterate.outputs.next_since }}
     steps:
-      - name: Checkout (full history for PR refs + retrospective)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
-      - name: Install benchmark dependencies
-        # ubuntu 24.04 has no libdbd-mariadb-perl package: build DBD::MariaDB from CPAN
+      - name: Dispatch the next iteration
         run: |
-          sudo apt-get update
-          sudo apt-get install -y cmake bison libncurses-dev libssl-dev zlib1g-dev \
-            libdbi-perl libmariadb-dev cpanminus jq
-          sudo cpanm --notest DBD::MariaDB
-
-      - name: Benchmark (payloads only, no upload)
-        env:
-          REF: ${{ inputs.ref }}
-          RETROSPECTIVE: ${{ inputs.retrospective }}
-          RETROSPECTIVE_LIMIT: ${{ inputs.retrospective_limit }}
-          FULL_BENCHMARK: ${{ inputs.full_benchmark }}
-        run: |
-          args=(--ref "$REF" --dry-run --out-dir "$RUNNER_TEMP/nyrkio_payloads")
-          if [ "$RETROSPECTIVE" = "true" ]; then
-            # a hosted job has 6h: the whole history (~10k commits) can never finish
-            if [ "$RETROSPECTIVE_LIMIT" -lt 1 ] || [ "$RETROSPECTIVE_LIMIT" -gt 50 ]; then
-              echo "::error::retrospective_limit must be between 1 and 50 (got $RETROSPECTIVE_LIMIT)"
-              exit 1
-            fi
-            args+=(--retrospective --limit "$RETROSPECTIVE_LIMIT")
-          fi
-          if [ "$FULL_BENCHMARK" = "true" ]; then
-            args+=(--full)
-          fi
-          bash scripts/nyrkio_benchmark.sh "${args[@]}"
-
-      - name: Keep payloads
-        uses: actions/upload-artifact@v4
-        with:
-          name: nyrkio-payloads
-          path: ${{ runner.temp }}/nyrkio_payloads/*.json
-          if-no-files-found: error
-
-  upload:
-    needs: benchmark
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout (upload script only)
-        uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - uses: actions/download-artifact@v4
-        with:
-          name: nyrkio-payloads
-          path: ${{ runner.temp }}/nyrkio_payloads
-
-      - name: Upload to Nyrkiö
-        env:
-          NYRKIO_JWT_TOKEN: ${{ secrets.NYRKIO_JWT_TOKEN }}
-          REF: ${{ inputs.ref }}
-        run: bash scripts/nyrkio_benchmark.sh --ref "$REF" --upload "$RUNNER_TEMP/nyrkio_payloads"
+          gh workflow run nyrkio-benchmark.yml --ref "$GITHUB_REF_NAME" \
+            -f ref="$REF" -f retrospective=true -f stride="$STRIDE" -f limit="$LIMIT" \
+            -f budget="$BUDGET" -f full_benchmark="$FULL_BENCHMARK" \
+            -f target="$TARGET" -f since="$SINCE"
