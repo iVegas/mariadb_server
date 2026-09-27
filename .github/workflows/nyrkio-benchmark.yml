@@ -117,6 +117,9 @@ jobs:
     needs: benchmark
     if: ${{ !cancelled() && needs.benchmark.result != 'skipped' }}
     runs-on: ubuntu-latest
+    # NYRKIO_JWT_TOKEN lives in the "main" GitHub Environment (Settings -> Environments),
+    # not a repo secret: a job only sees an environment's secrets when it declares it here.
+    environment: main
     steps:
       - name: Checkout (upload script only)
         uses: actions/checkout@v4
